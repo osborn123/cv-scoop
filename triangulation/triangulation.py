@@ -1,74 +1,55 @@
-import cv2 as cv
-import time
+import rclpy
+from rclpy.node import Node
+from sensor_msgs.msg import Image
+from cv_bridge import CvBridge
 import numpy as np
-import camera as ct
-import frame_angle as fa
+from frame_angle import Frame_Angle
 import detection as dt
 
-def capture_frame():
-    frame1 = left_camera.next()
-    frame2 = right_camera.next()
-    return frame1, frame2
+class TriangulationNode(Node):
+    def __init__(self):
+        super().__init__('triangulation_node')
 
-def filter_objects(targets, target_obj):
-    target = []
-    for detected_obj in targets:
-        if detected_obj[0] == target_obj:
-            target.append(detected_obj)
-    return target
+        self.subscription1 = self.create_subscription(
+            Image, 'camera1/image_raw', self.image_callback1, 10)
+        self.subscription2 = self.create_subscription(
+            Image, 'camera2/image_raw', self.image_callback2, 10)
 
-# ------------------------------
-# Global Variables
-# ------------------------------
-left_camera_source = "http://192.168.1.47"
-right_camera_source = "http://192.168.1.231"
+        self.bridge = CvBridge()
+        self.angler = Frame_Angle(1280, 1024, 63, 46)
+        self.camera_separation = 10.8
+        self.frame1 = None
+        self.frame2 = None
 
-pixel_width = 1280 # Use SXGA
-pixel_height = 1024
-angle_width = 63 # Measured by hand
-angle_height = 46 # Measured by hand
-frame_rate = 20
-camera_separation = 10.8 # Need to be set
+    def image_callback1(self, msg):
+        self.frame1 = self.bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
+        self.process_frames()
 
-# Two cameras
-left_camera = None
-right_camera = None
+    def image_callback2(self, msg):
+        self.frame2 = self.bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
+        self.process_frames()
 
-left_camera = ct.Camera_Thread(left_camera_source)
-left_camera.start()
-time.sleep(1)
-right_camera = ct.Camera_Thread(right_camera_source)
-right_camera.start()
-time.sleep(1)
+    def process_frames(self):
+        if self.frame1 is None or self.frame2 is None:
+            return
 
-# Build the frame angler
-angler = fa.Frame_Angle(pixel_width,pixel_height,angle_width,angle_height)
-angler.build_frame()
+        targets1 = dt.detection(self.frame1)
+        targets2 = dt.detection(self.frame2)
 
-# Get frames
-frame1, frame2 = capture_frame()
-target1 = dt.detection(frame1)
-target2 = dt.detection(frame2)
+        if len(targets1) == 0 or len(targets2) == 0:
+            return
 
-# Filter for a specific object(Set to chair for final project)
-filter_obj = 'bottle'
-target1 = filter_objects(target1, filter_obj)
-target2 = filter_objects(target2, filter_obj)
+        x1m = (targets1[0][3] - targets1[0][1]) // 2 + targets1[0][1]
+        y1m = (targets1[0][4] - targets1[0][2]) // 2 + targets1[0][2]
+        x2m = (targets2[0][3] - targets2[0][1]) // 2 + targets2[0][1]
+        y2m = (targets2[0][4] - targets2[0][2]) // 2 + targets2[0][2]
 
-# Check 1: Both frames have some objects
-# Check 2: Pick one object from 2 frames(Same y-axis, similar size)
+        xlangle, ylangle = self.angler.angles_from_center(x1m, y1m, top_left=True, degrees=True)
+        xrangle, yrangle = self.angler.angles_from_center(x2m, y2m, top_left=True, degrees=True)
 
-x1m = (target1[0][3] - target1[0][1]) // 2 + target1[0][1]
-y1m = (target1[0][4] - target1[0][2]) // 2 + target1[0][2]
-# Compute x2m and y2m in a similar way
-x2m = (target2[0][3] - target2[0][1]) // 2 + target2[0][1]
-y2m = (target2[0][4] - target2[0][2]) // 2 + target2[0][2]
+        X, Y, Z, D = self.angler.location(self.camera_separation, (xlangle, ylangle), (xrangle, yrangle), center=True, degrees=True)
+        self.get_logger().info(f"Target Position: X={X}, Y={Y}, Z={Z}, D={D}")
 
-xlangle,ylangle = angler.angles_from_center(x1m,y1m,top_left=True,degrees=True)
-xrangle,yrangle = angler.angles_from_center(x2m,y2m,top_left=True,degrees=True)
-
-X,Y,Z,D = angler.location(camera_separation,(xlangle,ylangle),(xrangle,yrangle),center=True,degrees=True)
-print("X:" + str(X))
-print("Y:" + str(Y))
-print("Z:" + str(Z))
-print("D:" + str(D))
+rclpy.init()
+node = TriangulationNode()
+rclpy.spin(node)
